@@ -1,0 +1,91 @@
+#By: Tyler Northrip
+#A Multi-threaded powershell script to compare a user's last login across multiple domain controllers
+#and write the most recent login to file. Good for finding old user accounts when your environment has multiple dcs
+
+
+Import-Module ActiveDirectory
+$ErrorActionPreference= 'silentlycontinue'
+function Get-ADUsersLastLogon()
+{
+  #ask powershell to get the domain controllers for you
+	#$dcs = Get-ADDomainController -Filter {Name -like "*"}
+  
+  #list of dc servers if you want to be specific, or if you want to use a dc from another domain
+	$dcs = "dc1.northriptl.cap","dc2.northriptl.cap","dc3.northriptl.cap"
+  
+  #get the list of users, limit to 5000
+	$users = Get-ADUser -SearchBase “OU=Users,DC=northriptl,DC=cap” -Filter * -ResultSetSize 5000
+
+	$time = 0
+	$exportFilePath = "C:\Users\northriptl\Desktop\Userlastlogon.txt"
+	$columns = "name,username,datetime"
+
+	Out-File -filepath $exportFilePath -force -InputObject $columns
+	
+	#mutex to handle multiple threads and one file
+	$mutexName = 'siadfnuawenfuiw'
+	$mutex = New-Object 'Threading.Mutex' $false, $mutexName
+  
+	$maxConcurrentJobs = 10 #Max. number of simultaneously running jobs
+  
+	#allow host to receive messages
+	$event = Register-EngineEvent -SourceIdentifier MyNewMessage -Action {
+		Write-Host $event.MessageData;
+	}
+  
+	#repeat the below code for each user discovered in Active Directory
+	foreach($user in $users) {
+		$Check = $false #Variable to allow endless looping until the number of running jobs will be less than $maxConcurrentJobs.
+		while ($Check -eq $false) {
+			if ((Get-Job -State 'Running').Count -lt $maxConcurrentJobs) {
+				$ScriptBlock = {
+					param($user, $dcs)
+					Register-EngineEvent -SourceIdentifier MyNewMessage -Forward
+					
+					foreach($dc in $dcs)
+					{ 
+					  $currentUser = Get-ADUser $user.SamAccountName -server $dc | Get-ADObject -Server $dc -Properties lastLogon
+					  $null = New-Event -SourceIdentifier MyNewMessage -MessageData ($user.name+ " at "+$dc+" checked")
+					  #loop to compare times and pick the most recent one
+					  if($currentUser.LastLogon -gt $time) 
+					  {
+						$time = $currentUser.LastLogon
+					  }
+					}
+
+					# Grab the mutex. Will block until this process has it.
+					$mutex.WaitOne();
+
+					$exportFilePath = "C:\Users\northriptl\Desktop\Userlastlogon.txt"
+					#gather info and format for writing
+					$dt = [DateTime]::FromFileTime($time)
+					$row = $user.Name+","+$user.SamAccountName+","+$dt
+					Out-File -filepath $exportFilePath -append -noclobber -InputObject $row
+					$null = New-Event -SourceIdentifier MyNewMessage -MessageData ($user.name+ " has finished being checked")
+					
+					$mutex.ReleaseMutex()
+					$mutex.Close()
+					
+					$time = 0
+				}#end scriptblock
+				
+				Start-Job -ScriptBlock $ScriptBlock -ArgumentList $user, $dcs
+				$Check = $true #To stop endless looping and proceed to the next object in the list.
+			}#end(if(get-job)
+		}#end while(check)
+	}#end foreach
+}#end Get-ADUsersLastLogon
+ 
+Get-ADUsersLastLogon
+
+While ((Get-Job -State 'Running').Count -gt 0) { 
+	Get-Job -State "Completed" | Receive-Job
+	Remove-Job -State "Completed"
+	
+	Write-Host "Waiting for" +((Get-Job -State "Running").Count)+ "job(s) to finish"
+	Start-Sleep 2 
+	}
+
+Write-Host "done"
+# Cleanup all jobs from memory IMPORTANT
+Remove-Job *
